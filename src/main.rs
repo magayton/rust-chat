@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8563").await?;
     let (tx, _rx) = broadcast::channel(10);
     let users = Arc::new(Mutex::new(HashMap::new()));
+    let msg_history = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
 
     // Spawn task (in background) handling connections
     // Cloning sender broadcast channel and Arc user map for every connection (user)
@@ -26,9 +27,10 @@ async fn main() -> Result<()> {
         let (socket, _) = listener.accept().await?;
         let tx = tx.clone();
         let users = Arc::clone(&users);
+        let msg_history = Arc::clone(&msg_history);
 
         tokio::spawn(async move {
-            handle_connection(socket, tx, users).await;
+            handle_connection(socket, tx, users, msg_history).await;
         });
     }
 }
@@ -37,6 +39,7 @@ async fn handle_connection(
     socket: TcpStream,
     tx: broadcast::Sender<(Uuid, String, String)>,
     users: Arc<Mutex<HashMap<Uuid, User>>>,
+    msg_history: Arc<Mutex<Vec<(String, String)>>>,
 ) {
     // Split the socket : Reading part get inputs (Line we write), Writing part write what we get (Line from all chat / whisper ...)
     // In terminal : reader = what we write, writer = what can write on terminal
@@ -58,6 +61,11 @@ async fn handle_connection(
     let (whisper_tx, whisper_rx) = mpsc::channel(10);
     let (write_tx, write_rx) = mpsc::channel(10);
 
+    writer
+        .write_all(format!("Welcome, {}!\n", nickname).as_bytes())
+        .await
+        .unwrap();
+
     // In own scop because of the Send trait error in task spawning if not
     {
         let mut users = users.lock().await;
@@ -69,14 +77,27 @@ async fn handle_connection(
                 whisper_sender: whisper_tx,
             },
         );
-    }
+
+        let msg_history = msg_history.lock().await;
+        for (nick, msg) in msg_history.iter() {
+            let message = format!("{}: {}\n", nick, msg);
+            writer.write_all(message.as_bytes()).await.unwrap();
+        }
+    };
 
     // Write Handle : Only focus to write to the socket (terminal)
     // Read Handle : Logic for sending and receving messages
     // Spawned in background but join so that we can quit
     let write_handle = tokio::spawn(handle_writes(writer, write_rx));
     let read_handle = tokio::spawn(handle_reads(
-        reader, tx, user_id, nickname, users, write_tx, whisper_rx,
+        reader,
+        tx,
+        user_id,
+        nickname,
+        users,
+        write_tx,
+        whisper_rx,
+        msg_history,
     ));
 
     tokio::try_join!(write_handle, read_handle).unwrap();
@@ -99,17 +120,13 @@ async fn handle_reads(
     users: Arc<Mutex<HashMap<Uuid, User>>>,
     write_tx: mpsc::Sender<String>,
     mut whisper_rx: mpsc::Receiver<String>,
+    msg_history: Arc<Mutex<Vec<(String, String)>>>,
 ) {
     let mut line = String::new();
 
     // Suscribe this connection to the broadcast channel so that we can receive "All messages" and write them
     // whisper_rx in parameter so that we can handle whispers receive
     let mut rx = tx.subscribe();
-
-    write_tx
-        .send(format!("Welcome, {}!\n", nickname))
-        .await
-        .unwrap();
 
     // Use write_tx to only write for the user
     // Use tx to write in all chat
@@ -145,7 +162,12 @@ async fn handle_reads(
                     write_tx.send("Available commands: /users, /whisper <nickname> <message>, /quit\n".to_string()).await.unwrap();
                 } else {
                     // Broadcast (tx) used here
-                    tx.send((user_id, nickname.clone(), msg)).unwrap();
+                    tx.send((user_id, nickname.clone(), msg.clone())).unwrap();
+                    // History msg update
+                    {
+                        let mut history = msg_history.lock().await;
+                        history.push((nickname.clone(), msg));
+                    }
                 }
                 line.clear();
             }
