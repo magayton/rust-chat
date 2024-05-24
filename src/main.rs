@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8563").await?;
     let (tx, _rx) = broadcast::channel(10);
     let users = Arc::new(Mutex::new(HashMap::new()));
-    let msg_history = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let msg_history = Arc::new(Mutex::new(vec![("Server:".to_string(), "messages history".to_string())]));
 
     // Spawn task (in background) handling connections
     // Cloning sender broadcast channel and Arc user map for every connection (user)
@@ -61,10 +61,9 @@ async fn handle_connection(
     let (whisper_tx, whisper_rx) = mpsc::channel(10);
     let (write_tx, write_rx) = mpsc::channel(10);
 
-    writer
-        .write_all(format!("Welcome, {}!\n", nickname).as_bytes())
-        .await
-        .unwrap();
+    if let Err(err) = writer.write_all(format!("Welcome, {}!\n", nickname).as_bytes()).await {
+        println!("Error sending welcome message to {}: {}", nickname, err);
+    }
 
     // In own scop because of the Send trait error in task spawning if not
     {
@@ -124,7 +123,7 @@ async fn handle_reads(
 ) {
     let mut line = String::new();
 
-    // Suscribe this connection to the broadcast channel so that we can receive "All messages" and write them
+    // Subscribe this connection to the broadcast channel so that we can receive "All messages" and write them
     // whisper_rx in parameter so that we can handle whispers receive
     let mut rx = tx.subscribe();
 
@@ -191,6 +190,7 @@ async fn handle_reads(
         let mut users = users.lock().await;
         users.remove(&user_id);
     }
+    
 }
 
 async fn send_whisper(
@@ -213,5 +213,49 @@ async fn send_whisper(
             .send(format!("User {} not found\n", target_nickname))
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncReadExt;
+    use super::*;
+
+    #[tokio::test]
+    async fn test_message_history() {
+        let history = Arc::new(Mutex::new(vec![
+            ("user1".to_string(), "Hello".to_string()),
+            ("user2".to_string(), "Hi".to_string()),
+        ]));
+        let (tx, _rx) = broadcast::channel(10);
+        let users = Arc::new(Mutex::new(HashMap::new()));
+    
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+    
+        let history_clone = Arc::clone(&history);
+        let users_clone = Arc::clone(&users);
+        let tx_clone = tx.clone();
+    
+        let server_handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, tx_clone, users_clone, history_clone).await;
+        });
+    
+        let client_handle = tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            socket.write_all(b"userTest\n").await.unwrap();
+    
+            let mut buffer = [0; 1024];
+            let n = socket.read(&mut buffer).await.unwrap();
+            let response = String::from_utf8_lossy(&buffer[..n]);
+            assert!(response.contains("user1: Hello"));
+            assert!(response.contains("user2: Hi"));
+            assert!(!response.contains("user1: Test"));
+
+            socket.write_all(b"yo").await.unwrap();
+        });
+    
+        tokio::try_join!(server_handle, client_handle).unwrap();
     }
 }
